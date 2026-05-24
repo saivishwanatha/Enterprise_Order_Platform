@@ -57,7 +57,9 @@
 
 **Publishes**: nothing
 
-**Consumes**: nothing (reads auth-service public key at startup for JWT verification)
+**Consumes**: nothing
+
+**JWT public key handling**: The RS256 public key used for JWT verification is loaded from the `JWT_PUBLIC_KEY` environment variable at startup (PEM-encoded). It is NOT fetched from auth-service at runtime. This eliminates the startup dependency on auth-service. The public key is rotated by updating the environment variable and redeploying the gateway — no auth-service call required at runtime.
 
 **Routing Table**:
 
@@ -86,7 +88,10 @@
 **Responsibilities**:
 - CRUD operations on products (admin)
 - Paginated, filterable product listings (all authenticated users)
-- Publish `product.created.v1` when a new product is created so inventory-service can initialise stock
+- Fetch `availableStock` from inventory-service via a synchronous REST call to include in product listing responses. If inventory-service is unavailable, return products with `availableStock: null` and `meta.stockDataAvailable: false` (degraded mode — circuit-breaker fallback).
+- Publish `product.created.v1` when a new product is created so inventory-service can initialise stock.
+- Price changes apply to future orders only. No event is required for price updates in v1 (consumers use the snapshot taken at order time).
+- Deactivation publishes `product.deactivated.v1`. inventory-service consumes this to mark the stock record inactive, preventing new reservations.
 
 **Does NOT own**:
 - Stock levels (owned by inventory-service)
@@ -94,12 +99,11 @@
 
 **Publishes**:
 - `product.created.v1`
-- `product.updated.v1`
 - `product.deactivated.v1`
 
 **Consumes**: nothing
 
-**Synchronous dependencies**: none
+**Synchronous dependencies**: inventory-service (REST, for stock display in product listing — circuit-breaker wrapped, fallback: `availableStock: null`)
 
 **Port**: 8082
 
@@ -117,7 +121,8 @@
 
 **Responsibilities**:
 - Create orders and initiate the fulfillment saga
-- Maintain the order state machine: `PENDING` → `CONFIRMED` → `FAILED` / `CANCELLED`
+- Resolve product name and unit price from product-service via a synchronous REST call at order creation time (circuit-breaker wrapped; order creation fails with 503 if product-service is unavailable after retries)
+- Maintain the order state machine: `PENDING` → `INVENTORY_RESERVED` → `PAYMENT_CAPTURED` → `CONFIRMED` / `FAILED` / `CANCELLED`
 - Listen for saga outcome events and advance order state
 - Expose the order timeline API
 - Allow admins to trigger retries on failed orders
@@ -125,10 +130,23 @@
 **Order State Machine**:
 ```
 PENDING
-  ├─► CONFIRMED (shipment created + invoice generated)
-  ├─► FAILED (inventory reservation failed OR payment failed)
-  └─► CANCELLED (customer or admin cancellation)
+  ├─► INVENTORY_RESERVED  (inventory.reserved.v1 received)
+  │     └─► PAYMENT_CAPTURED  (payment.captured.v1 received)
+  │               └─► CONFIRMED  (shipment.created.v1 received)
+  ├─► FAILED  (inventory.reservation_failed.v1 OR payment.failed.v1 received)
+  └─► CANCELLED  (customer cancels a PENDING order; admin cancels any non-terminal order)
 ```
+
+**Cancellation rules**:
+- Customers may cancel orders in `PENDING` or `INVENTORY_RESERVED` state only.
+- Admins may cancel orders in any non-terminal state (`PENDING`, `INVENTORY_RESERVED`, `PAYMENT_CAPTURED`).
+- Orders in `CONFIRMED`, `FAILED`, or `CANCELLED` state cannot be cancelled (returns `409`).
+- Cancelling a `PAYMENT_CAPTURED` order triggers a refund via `order.cancelled.v1` → payment-service issues refund.
+
+**Saga timeout**:
+- An order that remains in `PENDING` or `INVENTORY_RESERVED` for more than **30 minutes** without advancing is considered a stale saga.
+- A scheduled job (every 5 minutes) detects stale sagas, marks them `FAILED` with reason `SAGA_TIMEOUT`, publishes `order.failed.v1`, and triggers compensation (inventory release if applicable).
+- A CloudWatch alarm fires when any order exceeds the 30-minute threshold.
 
 **Does NOT own**:
 - Inventory levels, payment records, shipment details, invoice files
@@ -140,13 +158,16 @@ PENDING
 - `order.confirmed.v1`
 
 **Consumes**:
-- `inventory.reservation_failed.v1` → mark order FAILED, trigger compensation
-- `payment.failed.v1` → mark order FAILED
-- `shipment.created.v1` → record in timeline
-- `shipment.delivered.v1` → update order status
-- `invoice.generated.v1` → record in timeline, mark order CONFIRMED
+- `inventory.reservation_failed.v1` → mark order FAILED, publish order.failed.v1
+- `payment.failed.v1` → mark order FAILED, publish order.failed.v1
+- `inventory.reserved.v1` → advance order to INVENTORY_RESERVED, record in timeline
+- `payment.captured.v1` → advance order to PAYMENT_CAPTURED, record in timeline
+- `shipment.created.v1` → advance order to CONFIRMED, publish order.confirmed.v1, record in timeline
+- `shipment.delivered.v1` → record in timeline
+- `invoice.generated.v1` → record in timeline (does NOT gate CONFIRMED status)
 
-**Synchronous dependencies**: none (all cross-service communication is event-driven)
+**Synchronous dependencies**:
+- product-service (REST, at order creation time — circuit-breaker wrapped)
 
 **Port**: 8083
 
@@ -182,6 +203,7 @@ PENDING
 - `payment.failed.v1` → release reservation
 - `payment.captured.v1` → confirm reservation (finalise stock decrement)
 - `product.created.v1` → initialise stock record
+- `product.deactivated.v1` → mark stock record inactive (prevents new reservations)
 
 **Synchronous dependencies**: none
 
@@ -290,6 +312,8 @@ PENDING
 **Owns**:
 - Notification log (notification ID, recipient, channel, event type, status, sent timestamp)
 - Processed events table (for idempotency)
+
+**Note**: notification-service has no business domain state and does not participate in the saga. It has a database for audit logging and idempotency only. It can be scaled horizontally without coordination.
 
 **Responsibilities**:
 - Send email notifications on domain events

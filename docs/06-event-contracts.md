@@ -42,8 +42,10 @@ Every event published to SNS is wrapped in this envelope. The `payload` field co
 | `{env}-payment-events` | `payment.captured.v1`, `payment.failed.v1`, `payment.refunded.v1` |
 | `{env}-shipment-events` | `shipment.created.v1`, `shipment.dispatched.v1`, `shipment.in_transit.v1`, `shipment.delivered.v1` |
 | `{env}-invoice-events` | `invoice.generated.v1` |
-| `{env}-product-events` | `product.created.v1`, `product.updated.v1`, `product.deactivated.v1` |
+| `{env}-product-events` | `product.created.v1`, `product.deactivated.v1` |
 | `{env}-user-events` | `user.registered.v1` |
+
+Note: `product.updated.v1` is not published. Price changes apply to future orders only via the snapshot mechanism; no downstream service needs to react to a price update in v1.
 
 ---
 
@@ -92,9 +94,12 @@ Every queue has a paired DLQ: `{queue-name}-dlq`.
     }
   ],
   "totalAmount": 99.98,
+  "currency": "USD",
   "retryAttempt": 0
 }
 ```
+
+Note: `totalAmount` and `currency` are carried forward through the saga. inventory-service includes them in `inventory.reserved.v1` so payment-service can capture the correct amount without calling order-service.
 
 ---
 
@@ -153,12 +158,17 @@ Every queue has a paired DLQ: `{queue-name}-dlq`.
 {
   "reservationId": "uuid",
   "orderId": "uuid",
+  "customerId": "uuid",
+  "totalAmount": 99.98,
+  "currency": "USD",
   "reservedItems": [
     { "productId": "uuid", "quantity": 2 }
   ],
   "reservedAt": "2024-01-15T10:30:02Z"
 }
 ```
+
+Note: `totalAmount` and `currency` are carried from the `order.placed.v1` payload so payment-service does not need to call order-service to know the charge amount.
 
 ---
 

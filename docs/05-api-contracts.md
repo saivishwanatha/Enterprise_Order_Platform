@@ -64,6 +64,23 @@ Authenticate and receive tokens.
 
 ---
 
+### POST /api/v1/auth/logout — Authenticated
+Revoke the current refresh token.
+
+**Request**
+```json
+{ "refreshToken": "eyJ..." }
+```
+
+**Response 200**
+```json
+{ "data": { "message": "Logged out successfully." } }
+```
+
+**Errors**: `401` (token not found or already revoked)
+
+---
+
 ### POST /api/v1/auth/refresh — Public
 Exchange a refresh token for a new access token.
 
@@ -302,16 +319,25 @@ Get the event timeline for an order.
 ---
 
 ### POST /api/v1/orders/{orderId}/cancel — Authenticated
-Cancel an order. Customers can cancel their own `PENDING` orders. Admins can cancel any order.
+Cancel an order.
+
+**Cancellable states**:
+- Customers: `PENDING`, `INVENTORY_RESERVED` only.
+- Admins: `PENDING`, `INVENTORY_RESERVED`, `PAYMENT_CAPTURED`.
+- Orders in `CONFIRMED`, `FAILED`, or `CANCELLED` state cannot be cancelled.
+
+**Idempotency**: if the order is already `CANCELLED`, returns `200` with the current order (not `409`).
 
 **Response 200**: updated order object with `"status": "CANCELLED"`
 
-**Errors**: `403`, `404`, `409` (order not in cancellable state)
+**Errors**: `403` (customer attempting to cancel another customer's order), `404`, `409` (order in non-cancellable state)
 
 ---
 
 ### POST /api/v1/orders/{orderId}/retry — Admin only
 Retry a failed order (max 3 attempts).
+
+**Idempotency**: if the order is already in `PENDING` state (a previous retry is in progress), returns `409` — does not start a second concurrent saga.
 
 **Response 202**
 ```json
@@ -325,7 +351,7 @@ Retry a failed order (max 3 attempts).
 }
 ```
 
-**Errors**: `403`, `404`, `409` (order not in FAILED state or max retries exceeded)
+**Errors**: `403`, `404`, `409` (order not in FAILED state, max retries exceeded, or order already PENDING)
 
 ---
 
@@ -354,6 +380,8 @@ Get stock level for a product.
 ### PATCH /api/v1/inventory/{productId}/stock — Admin only
 Manually adjust stock level (e.g., after physical stock count).
 
+**Idempotency**: requires `Idempotency-Key` header. The same key within 24 hours returns the original response without re-applying the adjustment.
+
 **Request**
 ```json
 {
@@ -363,6 +391,8 @@ Manually adjust stock level (e.g., after physical stock count).
 ```
 
 **Response 200**: updated stock object
+
+**Errors**: `400` (missing Idempotency-Key), `404`
 
 ---
 
@@ -414,6 +444,33 @@ Get shipment for an order.
 ```
 
 **Errors**: `403`, `404`
+
+---
+
+### POST /api/v1/shipments/{shipmentId}/dispatch — Admin only
+Transition shipment to `DISPATCHED`. Idempotent — calling when already `DISPATCHED` returns `200`.
+
+**Response 200**: updated shipment object
+
+**Errors**: `403`, `404`, `409` (shipment not in `CREATED` state)
+
+---
+
+### POST /api/v1/shipments/{shipmentId}/in-transit — Admin only
+Transition shipment to `IN_TRANSIT`. Idempotent — calling when already `IN_TRANSIT` returns `200`.
+
+**Response 200**: updated shipment object
+
+**Errors**: `403`, `404`, `409` (shipment not in `DISPATCHED` state)
+
+---
+
+### POST /api/v1/shipments/{shipmentId}/deliver — Admin only
+Transition shipment to `DELIVERED`. Idempotent — calling when already `DELIVERED` returns `200`.
+
+**Response 200**: updated shipment object
+
+**Errors**: `403`, `404`, `409` (shipment not in `IN_TRANSIT` state)
 
 ---
 
